@@ -21,6 +21,45 @@ use rustc_span::{Span, Symbol};
 use crate::Session;
 use crate::lint::{Lint, LintId};
 
+/// Whether a `#[test]`/`#[bench]` function is expected to panic, mirroring
+/// `test::ShouldPanic` in libtest.
+#[derive(Clone, Copy, Debug)]
+pub enum TestShouldPanic {
+    No,
+    Yes,
+    YesWithMessage(Symbol),
+}
+
+/// The `test::TestType` a collected test was classified as, mirroring libtest.
+#[derive(Clone, Copy, Debug)]
+pub enum CollectedTestType {
+    UnitTest,
+    IntegrationTest,
+    Unknown,
+}
+
+/// A `#[test]` or `#[bench]` function found while expanding a `--test` crate.
+///
+/// This mirrors the `test::TestDesc` value that `#[test]` expansion emits into the
+/// crate, so that `-Zdump-test-names` can report the same information the linked
+/// test binary would report from `--list`, without running codegen or the linker.
+#[derive(Clone, Debug)]
+pub struct CollectedTest {
+    /// The test's path as libtest prints it, e.g. `module::nested::test_name`.
+    pub name: Symbol,
+    /// True for `#[bench]`, false for `#[test]`.
+    pub is_bench: bool,
+    pub ignore: bool,
+    pub ignore_message: Option<Symbol>,
+    pub should_panic: TestShouldPanic,
+    pub test_type: CollectedTestType,
+    pub source_file: Symbol,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+}
+
 /// Collected spans during parsing for places where a certain feature was
 /// used and should be feature gated accordingly in `check_crate`.
 #[derive(Default)]
@@ -92,6 +131,14 @@ pub struct ParseSess {
     pub symbol_gallery: SymbolGallery,
     /// Used to generate new `AttrId`s. Every `AttrId` is unique.
     pub attr_id_generator: AttrIdGenerator,
+    /// `#[test]`/`#[bench]` functions seen during expansion, keyed by the test path
+    /// libtest would print. Only populated when `-Zdump-test-names` is in effect.
+    ///
+    /// `rustc_builtin_macros::test` fills this in as it expands each `#[test]`
+    /// attribute, and `rustc_builtin_macros::test_harness` then prunes it down to
+    /// exactly the tests the generated harness registers, in the same order the
+    /// harness registers them. The driver serializes the result.
+    pub collected_tests: Lock<FxIndexMap<Symbol, CollectedTest>>,
 }
 
 impl ParseSess {
@@ -118,6 +165,7 @@ impl ParseSess {
             gated_spans: GatedSpans::default(),
             symbol_gallery: SymbolGallery::default(),
             attr_id_generator: AttrIdGenerator::new(),
+            collected_tests: Lock::new(Default::default()),
         }
     }
 

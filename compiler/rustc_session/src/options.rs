@@ -2467,6 +2467,12 @@ options! {
         "output statistics about monomorphization collection"),
     dump_mono_stats_format: DumpMonoStatsFormat = (DumpMonoStatsFormat::Markdown, parse_dump_mono_stats, [UNTRACKED],
         "the format to use for -Z dump-mono-stats (`markdown` (default) or `json`)"),
+    dump_test_names: SwitchWithOptPath = (SwitchWithOptPath::Disabled,
+        parse_switch_with_opt_path, [UNTRACKED],
+        "when compiling with `--test`, write the collected `#[test]`/`#[bench]` descriptors \
+        as JSON and stop before analysis, codegen and linking. Writes to stdout, or to the \
+        given path with `-Zdump-test-names=<path>`. Has no effect on crates that are not \
+        compiled with `--test` (default: no)"),
     #[rustc_lint_opt_deny_field_access("use `Session::dwarf_version` instead of this field")]
     dwarf_version: Option<u32> = (None, parse_opt_number, [TRACKED],
         "version of DWARF debug information to emit (default: 2 or 4, depending on platform)"),
