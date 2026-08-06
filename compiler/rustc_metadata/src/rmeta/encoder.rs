@@ -7,9 +7,12 @@ use std::sync::Arc;
 
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::memmap::{Mmap, MmapMut};
+use rustc_data_structures::stable_hash::StableHasher;
+use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{par_for_each_in, par_join};
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_data_structures::thousands::usize_with_underscores;
+use rustc_hashes::Hash64;
 use rustc_hir as hir;
 use rustc_hir::attrs::{AttributeKind, EncodeCrossCrate};
 use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE, LocalDefId, LocalDefIdSet};
@@ -27,12 +30,12 @@ use rustc_middle::ty::fast_reject::{self, TreatParams};
 use rustc_middle::{bug, span_bug};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder, opaque};
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
-use rustc_session::config::{CrateType, OptLevel, TargetModifier};
+use rustc_session::config::{CrateType, OptLevel, RmetaStripSpans, TargetModifier};
 use rustc_span::def_id::CRATE_MOD_ID;
-use rustc_span::hygiene::HygieneEncodeContext;
+use rustc_span::hygiene::{ExpnHash, HygieneEncodeContext};
 use rustc_span::{
-    ByteSymbol, ExternalSource, FileName, SourceFile, SpanData, SpanEncoder, StableSourceFileId,
-    Symbol, SyntaxContext, sym,
+    ByteSymbol, DUMMY_SP, ExternalSource, FileName, SourceFile, SpanData, SpanEncoder,
+    StableSourceFileId, Symbol, SyntaxContext, sym,
 };
 use tracing::{debug, instrument, trace};
 
@@ -68,6 +71,29 @@ pub(super) struct EncodeContext<'a, 'tcx> {
     hygiene_ctxt: &'a HygieneEncodeContext,
     // Used for both `Symbol`s and `ByteSymbol`s.
     symbol_index_table: FxHashMap<u32, usize>,
+
+    // The effective `-Zrmeta-strip-spans` mode. Forced to
+    // `RmetaStripSpans::None` for proc-macro crates: their metadata consists
+    // almost entirely of span, hygiene and quoted-span data that dependent
+    // crates rely on for expansion, so stripping it would gut the crate
+    // rather than stabilize it.
+    strip_spans: RmetaStripSpans,
+    // While `true`, `encode_span` does not strip spans in
+    // `RmetaStripSpans::NonExported` mode. Set around the metadata regions
+    // whose contents are compiled into dependent crates (MIR bodies and
+    // hygiene expansion data), where spans feed debuginfo and macro expansion
+    // rather than just diagnostics.
+    span_stripping_paused: bool,
+    // The content-derived SVH computed by `encode_crate_root` under
+    // `-Zrmeta-content-svh`, so `encode_metadata` can reuse it for the
+    // metadata stub. `None` when the flag is off or the root has not been
+    // encoded yet.
+    content_svh: Option<Svh>,
+    // In `RmetaStripSpans::NonExported` mode, the local defs whose MIR is
+    // exported (the `should_encode_mir` set); their item-level spans are
+    // preserved together with their body spans. Empty in other modes.
+    // Populated by `encode_def_ids`.
+    mir_exported_defs: LocalDefIdSet,
 }
 
 /// If the current crate is a proc-macro, returns early with `LazyArray::default()`.
@@ -171,6 +197,16 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
     }
 
     fn encode_span(&mut self, span: Span) {
+        // `-Zrmeta-strip-spans`: encode a dummy span instead of the real one,
+        // so that the encoded bytes do not depend on source positions. What
+        // this gives up: any consumer of this span in a dependent crate (e.g.
+        // a "function defined here" diagnostic note, or, in `all` mode,
+        // debuginfo line info for inlined MIR) sees `DUMMY_SP` instead of a
+        // location in this crate's source. Spans of source files that are
+        // never referenced are not encoded at all, which also keeps the
+        // source file table (and its per-file content hashes) from being
+        // encoded for stripped files.
+        let span = if self.should_strip_span() { DUMMY_SP } else { span };
         match self.span_shorthands.entry(span) {
             Entry::Occupied(o) => {
                 // If an offset is smaller than the absolute position, we encode with the offset.
@@ -426,6 +462,35 @@ macro_rules! record_defaulted_array {
 }
 
 impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
+    /// Whether `encode_span` should replace the span it is about to encode
+    /// with `DUMMY_SP`. See `RmetaStripSpans` for the semantics of each mode.
+    fn should_strip_span(&self) -> bool {
+        match self.strip_spans {
+            RmetaStripSpans::None => false,
+            RmetaStripSpans::NonExported => !self.span_stripping_paused,
+            RmetaStripSpans::All => true,
+        }
+    }
+
+    /// Runs `f` with span stripping paused, for metadata regions whose spans
+    /// are exported for downstream compilation (MIR bodies, hygiene data) and
+    /// must stay faithful in `RmetaStripSpans::NonExported` mode.
+    fn with_span_stripping_paused<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let old = std::mem::replace(&mut self.span_stripping_paused, true);
+        let res = f(self);
+        self.span_stripping_paused = old;
+        res
+    }
+
+    /// Whether `def_id`'s item-level spans (`def_span`, `def_ident_span`)
+    /// must be preserved in `RmetaStripSpans::NonExported` mode because the
+    /// item's MIR is exported. See the comment at the use site in
+    /// `encode_def_ids`.
+    fn preserve_item_spans(&self, def_id: LocalDefId) -> bool {
+        self.strip_spans == RmetaStripSpans::NonExported
+            && self.mir_exported_defs.contains(&def_id)
+    }
+
     fn emit_lazy_distance(&mut self, position: NonZero<usize>) {
         let pos = position.get();
         let distance = match self.lazy_state {
@@ -596,6 +661,31 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 local_crate_stable_id,
             );
 
+            // `-Zrmeta-normalize-src-hash`: the recorded hash covers the whole
+            // file's raw text, so *any* edit to the file (even a comment that
+            // moves no token) perturbs it and thereby the metadata bytes.
+            // Replace it with an all-zero hash of the same kind. What is given
+            // up, per consumer of this field:
+            // - Cross-crate diagnostic snippet rendering: a dependent crate
+            //   verifies the on-disk source against this hash before quoting
+            //   it in diagnostics. The zero hash never matches, so such
+            //   diagnostics degrade to file:line:col without a quoted snippet
+            //   (instead of risking quoting stale source).
+            // - Debuginfo: file checksums recorded for this crate's files in
+            //   dependent crates' debug info become zero, so debuggers cannot
+            //   detect source-file staleness for them.
+            // Proc-macro crates are exempt (see the `strip_spans` field docs).
+            if !self.is_proc_macro && self.tcx.sess.opts.unstable_opts.rmeta_normalize_src_hash {
+                adapted_source_file.src_hash =
+                    rustc_span::SourceFileHash::zeroed(adapted_source_file.src_hash.kind);
+                // Same reasoning for the optional cargo-freshness checksum
+                // (`-Zchecksum-hash-algorithm`), which also covers the whole
+                // file's text.
+                adapted_source_file.checksum_hash = adapted_source_file
+                    .checksum_hash
+                    .map(|hash| rustc_span::SourceFileHash::zeroed(hash.kind));
+            }
+
             let on_disk_index: u32 =
                 on_disk_index.try_into().expect("cannot export more than U32_MAX files");
             adapted.set_some(on_disk_index, self.lazy(adapted_source_file));
@@ -655,7 +745,11 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         let incoherent_impls = stat!("incoherent-impls", || self.encode_incoherent_impls());
 
-        _ = stat!("mir", || self.encode_mir());
+        // MIR bodies are compiled into dependent crates (cross-crate inlining,
+        // generic instantiation, const eval), so their spans reach dependent
+        // debuginfo and const-eval backtraces. In `-Zrmeta-strip-spans=non-exported`
+        // mode they are preserved; only `all` mode strips them.
+        _ = stat!("mir", || self.with_span_stripping_paused(|this| this.encode_mir()));
 
         _ = stat!("def-ids", || self.encode_def_ids());
 
@@ -712,7 +806,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         // the incremental cache. If this causes us to deserialize a `Span`, then we may load
         // additional `SyntaxContext`s into the global `HygieneData`. Therefore, we need to encode
         // the hygiene data last to ensure that we encode any `SyntaxContext`s that might be used.
-        let (syntax_contexts, expn_data, expn_hashes) = stat!("hygiene", || self.encode_hygiene());
+        // Hygiene expansion data feeds macro expansion and hygiene resolution
+        // in dependent crates, so like MIR it is preserved in
+        // `-Zrmeta-strip-spans=non-exported` mode and only stripped (with
+        // span-independent expansion hashes substituted) in `all` mode.
+        let (syntax_contexts, expn_data, expn_hashes) =
+            stat!("hygiene", || self.with_span_stripping_paused(|this| this.encode_hygiene()));
 
         let def_path_hash_map = stat!("def-path-hash-map", || self.encode_def_path_hash_map());
 
@@ -725,11 +824,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         let root = stat!("final", || {
             let attrs = tcx.hir_krate_attrs();
+            let hash = self.metadata_svh();
             self.lazy(CrateRoot {
                 header: CrateHeader {
                     name: tcx.crate_name(LOCAL_CRATE),
                     triple: tcx.sess.opts.target_triple.clone(),
-                    hash: tcx.crate_hash(LOCAL_CRATE),
+                    hash,
                     is_proc_macro_crate: proc_macro_data.is_some(),
                     is_stub: false,
                 },
@@ -848,6 +948,78 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         }
 
         root
+    }
+
+    /// Returns the SVH to embed in the crate root header (and, mirrored, in
+    /// the metadata stub header).
+    ///
+    /// By default this is the HIR-based `crate_hash` query, which covers
+    /// essentially the whole crate (all bodies, source file names, spans when
+    /// incremental is enabled, ...), so *any* edit to the crate changes it,
+    /// and with it the metadata bytes, even when nothing a dependent crate
+    /// consumes has changed.
+    ///
+    /// Under `-Zrmeta-content-svh` the SVH is instead derived from the
+    /// encoded metadata bytes themselves: everything written before the
+    /// `CrateRoot` (this method must be called exactly when the root is about
+    /// to be encoded), which is all tables, MIR, hygiene and source map data.
+    /// That makes the SVH stable exactly when the rest of the metadata is.
+    /// Two extra inputs are mixed in for fields that appear only in the root
+    /// and thus after the hashed region: the session's dep-tracking hash
+    /// (covering every `[TRACKED]` option, e.g. `-Cextra-filename`, panic
+    /// strategy, edition, symbol mangling version) and the `StableCrateId`.
+    ///
+    /// Soundness of the link-time consistency check: a dependent compiled
+    /// against this crate's `.rmeta` records the SVH it read from that
+    /// metadata (`CrateDep.hash`), and the crate loader accepts an `.rlib` at
+    /// link time only if the metadata embedded in it carries an equal SVH.
+    /// The `.rmeta` and `.rlib` produced by one compiler invocation embed the
+    /// same encoded metadata, so they always agree. If the crate is
+    /// recompiled after a non-interface edit and the metadata bytes come out
+    /// identical, the new `.rlib` carries the same SVH as the cached
+    /// `.rmeta`, so a dependent compiled against the cached `.rmeta` links
+    /// the fresh `.rlib` -- which is precisely the early-cutoff behavior this
+    /// flag exists for. If any encoded byte differs, the SVH differs and the
+    /// loader rejects the mismatch, exactly as with the HIR-based SVH.
+    ///
+    /// Mixed toolchains: the SVH is an opaque 128-bit value compared only for
+    /// equality, and it never leaves the encoded metadata (the local
+    /// `crate_hash` query is unaffected by this flag). A dependent compiled
+    /// by an older compiler against old-scheme metadata simply recorded that
+    /// metadata's (old-scheme) SVH; artifacts from different compilers or
+    /// different flag settings have different metadata bytes anyway and are
+    /// never interchangeable in the first place.
+    fn metadata_svh(&mut self) -> Svh {
+        let tcx = self.tcx;
+        if !tcx.sess.opts.unstable_opts.rmeta_content_svh {
+            return tcx.crate_hash(LOCAL_CRATE);
+        }
+
+        // Hash the bytes encoded so far, i.e. the whole metadata file except
+        // the `CrateRoot` that is about to be written. This mirrors the
+        // re-read that `-Zmeta-stats` performs.
+        self.opaque.flush();
+        let mut file = self.opaque.file();
+        let pos_before_rewind = file.stream_position().unwrap();
+        file.rewind().unwrap();
+
+        let mut hasher = StableHasher::new();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = file.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            std::hash::Hasher::write(&mut hasher, &buf[..n]);
+        }
+        assert_eq!(file.stream_position().unwrap(), pos_before_rewind);
+
+        std::hash::Hash::hash(&tcx.sess.opts.dep_tracking_hash(true), &mut hasher);
+        std::hash::Hash::hash(&tcx.stable_crate_id(LOCAL_CRATE), &mut hasher);
+
+        let svh = Svh::new(hasher.finish());
+        self.content_svh = Some(svh);
+        svh
     }
 }
 
@@ -1417,6 +1589,23 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         let tcx = self.tcx;
 
+        if self.strip_spans == RmetaStripSpans::NonExported {
+            // Compute the set of defs whose MIR will be exported (the same
+            // filter `encode_mir` uses), so their item-level spans can be
+            // preserved below.
+            let reachable_set = tcx.reachable_set(());
+            self.mir_exported_defs = tcx
+                .mir_keys(())
+                .iter()
+                .copied()
+                .filter(|&def_id| {
+                    let (encode_const, encode_opt) =
+                        should_encode_mir(tcx, reachable_set, def_id);
+                    encode_const || encode_opt
+                })
+                .collect();
+        }
+
         for local_id in tcx.iter_local_def_id() {
             let def_id = local_id.to_def_id();
             let def_kind = tcx.def_kind(local_id);
@@ -1440,9 +1629,25 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 record!(self.tables.default_fields[def_id] <- anon.def_id.to_def_id());
             }
 
+            // In `RmetaStripSpans::NonExported` mode, the definition spans of
+            // items whose MIR is exported must survive alongside the MIR body
+            // spans: a dependent crate that inlines such an item derives the
+            // function's debuginfo declaration file/line from its `def_span`,
+            // and binds the inlined instructions' line rows to that file. With
+            // the definition span stripped but body spans kept, the dependent
+            // would emit line rows carrying this crate's real line numbers
+            // bound to one of its own files, i.e. confidently wrong debuginfo
+            // (empirically verified via DWARF inspection).
+            let preserve_item_spans = self.preserve_item_spans(local_id);
             if should_encode_span(def_kind) {
                 let def_span = tcx.def_span(local_id);
-                record!(self.tables.def_span[def_id] <- def_span);
+                if preserve_item_spans {
+                    self.with_span_stripping_paused(
+                        |this| record!(this.tables.def_span[def_id] <- def_span),
+                    );
+                } else {
+                    record!(self.tables.def_span[def_id] <- def_span);
+                }
             }
             if should_encode_attrs(def_kind) {
                 self.encode_attrs(local_id);
@@ -1453,7 +1658,13 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             if should_encode_span(def_kind)
                 && let Some(ident_span) = tcx.def_ident_span(def_id)
             {
-                record!(self.tables.def_ident_span[def_id] <- ident_span);
+                if preserve_item_spans {
+                    self.with_span_stripping_paused(
+                        |this| record!(this.tables.def_ident_span[def_id] <- ident_span),
+                    );
+                } else {
+                    record!(self.tables.def_ident_span[def_id] <- ident_span);
+                }
             }
             if def_kind.has_codegen_attrs() {
                 record!(self.tables.codegen_fn_attrs[def_id] <- self.tcx.codegen_fn_attrs(def_id));
@@ -1961,6 +2172,35 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             },
             |(this, _, expn_data_table, expn_hash_table), index, expn_data, hash| {
                 if let Some(index) = index.as_local() {
+                    // `-Zrmeta-strip-spans=all`: the real `ExpnHash` is
+                    // computed over the `ExpnData`, whose inputs include
+                    // source positions (call site and definition site spans),
+                    // so it churns whenever source positions shift. Since the
+                    // `ExpnData` we encode alongside it has had its spans
+                    // stripped anyway, substitute a hash derived from the
+                    // crate-local expansion index. Dependent crates use this
+                    // hash only as an opaque, globally unique identity for
+                    // deduplicating decoded expansions (its upper half must
+                    // remain this crate's `StableCrateId`, which
+                    // `ExpnHash::from_parts` preserves); the index is unique
+                    // within the crate, and `index + 1` keeps it non-zero so
+                    // it cannot collide with the root expansion hash. What is
+                    // given up: the hash no longer reflects the expansion's
+                    // contents, so a dependent's incremental cache keyed on it
+                    // sees changes only when this crate's metadata changes at
+                    // all (which is exactly the point). The root expansion
+                    // (index 0) keeps its real hash, which is already
+                    // span-independent (`Fingerprint::ZERO`).
+                    let hash = if this.strip_spans == RmetaStripSpans::All
+                        && index.as_raw().as_u32() != 0
+                    {
+                        ExpnHash::from_parts(
+                            this.tcx.stable_crate_id(LOCAL_CRATE),
+                            Hash64::new(u64::from(index.as_raw().as_u32()) + 1),
+                        )
+                    } else {
+                        hash
+                    };
                     expn_data_table.set_some(index.as_raw(), this.lazy(expn_data));
                     expn_hash_table.set_some(index.as_raw(), this.lazy(hash));
                 }
@@ -2454,19 +2694,13 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
     tcx.dep_graph.assert_ignored();
 
     // Generate the metadata stub manually, as that is a small file compared to full metadata.
-    if let Some(ref_path) = ref_path {
-        let _prof_timer = tcx.prof.verbose_generic_activity("generate_crate_metadata_stub");
-
-        with_encode_metadata_header(tcx, ref_path, |ecx| {
-            let header: LazyValue<CrateHeader> = ecx.lazy(CrateHeader {
-                name: tcx.crate_name(LOCAL_CRATE),
-                triple: tcx.sess.opts.target_triple.clone(),
-                hash: tcx.crate_hash(LOCAL_CRATE),
-                is_proc_macro_crate: false,
-                is_stub: true,
-            });
-            header.position.get()
-        })
+    //
+    // With `-Zrmeta-content-svh` the SVH is only known once the full metadata
+    // has been encoded, so the stub (which must carry the same SVH) is
+    // generated after the full metadata instead, at the end of this function.
+    let rmeta_content_svh = tcx.sess.opts.unstable_opts.rmeta_content_svh;
+    if !rmeta_content_svh && let Some(ref_path) = ref_path {
+        encode_stub(tcx, ref_path, tcx.crate_hash(LOCAL_CRATE));
     }
 
     let _prof_timer = tcx.prof.verbose_generic_activity("generate_crate_metadata");
@@ -2505,7 +2739,7 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
 
     // Perform metadata encoding inside a task, so the dep-graph can check if any encoded
     // information changes, and maybe reuse the work product.
-    tcx.dep_graph.with_task(
+    let (content_svh, _) = tcx.dep_graph.with_task(
         dep_node,
         tcx,
         || {
@@ -2523,18 +2757,44 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
                     ecx.opaque.file().metadata().unwrap().len(),
                 );
 
-                root.position.get()
+                (root.position.get(), ecx.content_svh)
             })
         },
         None,
     );
+
+    // See above: with `-Zrmeta-content-svh` the stub is generated after the
+    // full metadata so it can embed the content-derived SVH. The incremental
+    // green-reuse path above cannot be taken here because the flag is
+    // rejected in combination with `-Cincremental` at session setup.
+    if rmeta_content_svh && let Some(ref_path) = ref_path {
+        let content_svh =
+            content_svh.expect("-Zrmeta-content-svh: no SVH computed during metadata encoding");
+        encode_stub(tcx, ref_path, content_svh);
+    }
 }
 
-fn with_encode_metadata_header(
+/// Writes a metadata stub (a file containing only the crate header) to `path`.
+fn encode_stub(tcx: TyCtxt<'_>, path: &Path, hash: Svh) {
+    let _prof_timer = tcx.prof.verbose_generic_activity("generate_crate_metadata_stub");
+
+    with_encode_metadata_header(tcx, path, |ecx| {
+        let header: LazyValue<CrateHeader> = ecx.lazy(CrateHeader {
+            name: tcx.crate_name(LOCAL_CRATE),
+            triple: tcx.sess.opts.target_triple.clone(),
+            hash,
+            is_proc_macro_crate: false,
+            is_stub: true,
+        });
+        (header.position.get(), ())
+    })
+}
+
+fn with_encode_metadata_header<R>(
     tcx: TyCtxt<'_>,
     path: &Path,
-    f: impl FnOnce(&mut EncodeContext<'_, '_>) -> usize,
-) {
+    f: impl FnOnce(&mut EncodeContext<'_, '_>) -> (usize, R),
+) -> R {
     let mut encoder = opaque::FileEncoder::new(path)
         .unwrap_or_else(|err| tcx.dcx().emit_fatal(FailCreateFileEncoder { err }));
     encoder.emit_raw_bytes(METADATA_HEADER);
@@ -2564,12 +2824,21 @@ fn with_encode_metadata_header(
         is_proc_macro: tcx.crate_types().contains(&CrateType::ProcMacro),
         hygiene_ctxt: &hygiene_ctxt,
         symbol_index_table: Default::default(),
+        // See the field docs for why proc-macro crates are exempt.
+        strip_spans: if tcx.crate_types().contains(&CrateType::ProcMacro) {
+            RmetaStripSpans::None
+        } else {
+            tcx.sess.opts.unstable_opts.rmeta_strip_spans
+        },
+        span_stripping_paused: false,
+        content_svh: None,
+        mir_exported_defs: LocalDefIdSet::default(),
     };
 
     // Encode the rustc version string in a predictable location.
     rustc_version(tcx.sess.cfg_version).encode(&mut ecx);
 
-    let root_position = f(&mut ecx);
+    let (root_position, res) = f(&mut ecx);
 
     // Make sure we report any errors from writing to the file.
     // If we forget this, compilation can succeed with an incomplete rmeta file,
@@ -2582,6 +2851,8 @@ fn with_encode_metadata_header(
     if let Err(err) = encode_root_position(file, root_position) {
         tcx.dcx().emit_fatal(FailWriteFile { path: ecx.opaque.path(), err });
     }
+
+    res
 }
 
 fn encode_root_position(mut file: &File, pos: usize) -> Result<(), std::io::Error> {

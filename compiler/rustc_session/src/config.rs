@@ -637,6 +637,69 @@ impl FromStr for SplitDwarfKind {
     }
 }
 
+/// The value of `-Zrmeta-strip-spans`, controlling which spans are replaced by
+/// `DUMMY_SP` when encoding crate metadata.
+///
+/// Spans in crate metadata are encoded as byte offsets into this crate's
+/// source files, so any edit that shifts source positions (adding a comment, a
+/// blank line, ...) changes the encoded bytes of the `.rmeta` even when the
+/// crate's interface is unchanged. Build systems that content-address the
+/// `.rmeta` (to skip rebuilding dependents when it is unchanged) can opt into
+/// stripping those spans, trading diagnostic and debuginfo quality in
+/// *dependent* crates for byte-stability of the metadata. See the variants for
+/// exactly what each level gives up. Has no effect on proc-macro crates, whose
+/// metadata is dominated by span and hygiene data that consumers rely on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RmetaStripSpans {
+    /// Encode all spans faithfully (default).
+    None,
+    /// Strip spans everywhere except in the parts of metadata that dependent
+    /// crates compile into their own output: encoded MIR bodies (used for
+    /// cross-crate inlining, generic instantiation, and const evaluation),
+    /// hygiene expansion data, and the definition spans of items whose MIR is
+    /// exported (a dependent deriving debuginfo for an inlined function takes
+    /// its declaration file/line from the definition span; stripping it while
+    /// keeping body spans was verified to produce line rows bound to the
+    /// wrong file). What is given up: diagnostics reported in dependent
+    /// crates lose the ability to point into this crate's source for
+    /// item-level spans of items without exported MIR (e.g. "function defined
+    /// here" notes fall back to dummy spans).
+    ///
+    /// Stability boundary (measured, deliberate): because the preserved spans
+    /// are byte offsets and the referenced source files' length and line
+    /// tables must stay real for those spans to resolve correctly in
+    /// dependents, only edits that preserve byte positions (same-length
+    /// comment rewrites, same-length body edits) leave the metadata
+    /// byte-identical in this mode. Any length-changing edit, even a comment
+    /// appended at end of file, perturbs the source file record and thus the
+    /// metadata. Use `All` when byte-stability under general non-interface
+    /// edits is the goal.
+    NonExported,
+    /// Additionally strip spans inside encoded MIR bodies and hygiene
+    /// expansion data, and replace expansion hashes with span-independent
+    /// ones. What is given up on top of `NonExported`: debuginfo line
+    /// information in dependent crates for code inlined or instantiated from
+    /// this crate, const-eval error backtraces pointing into this crate, and
+    /// macro-backtrace notes for this crate's macros. In exchange, the
+    /// metadata bytes no longer depend on source positions at all, so
+    /// non-interface edits (comments, whitespace, private non-inlined
+    /// function bodies) leave the `.rmeta` byte-identical.
+    All,
+}
+
+impl FromStr for RmetaStripSpans {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, ()> {
+        Ok(match s {
+            "none" => RmetaStripSpans::None,
+            "non-exported" => RmetaStripSpans::NonExported,
+            "all" => RmetaStripSpans::All,
+            _ => return Err(()),
+        })
+    }
+}
+
 macro_rules! define_output_types {
     (
         $(
@@ -2736,6 +2799,16 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
 
     let incremental = cg.incremental.as_ref().map(PathBuf::from);
 
+    // `-Zrmeta-content-svh` derives the metadata SVH from the freshly encoded
+    // metadata bytes. With incremental compilation the metadata work product
+    // can be reused from a previous session without re-encoding, in which case
+    // there are no fresh bytes to hash (and the incremental system separately
+    // uses the HIR-based SVH to name session directories). Rather than
+    // silently mixing the two schemes, reject the combination.
+    if unstable_opts.rmeta_content_svh && incremental.is_some() {
+        early_dcx.early_fatal("option `-Z rmeta-content-svh` cannot be used with `-C incremental`");
+    }
+
     if cg.profile_generate.enabled() && cg.profile_use.is_some() {
         early_dcx.early_fatal("options `-C profile-generate` and `-C profile-use` are exclusive");
     }
@@ -3316,8 +3389,8 @@ pub(crate) mod dep_tracking {
         InstrumentMcountOpts, InstrumentXRay, LinkerPluginLto, LocationDetail, LtoCli,
         MirStripDebugInfo, NextSolverConfig, Offload, OptLevel, OutFileName, OutputType,
         OutputTypes, PatchableFunctionEntry, PointerAuthOption, Polonius, ResolveDocLinks,
-        SourceFileHashAlgorithm, SplitDwarfKind, SwitchWithOptPath, SymbolManglingVersion,
-        WasiExecModel,
+        RmetaStripSpans, SourceFileHashAlgorithm, SplitDwarfKind, SwitchWithOptPath,
+        SymbolManglingVersion, WasiExecModel,
     };
     use crate::lint;
     use crate::utils::NativeLib;
@@ -3402,6 +3475,7 @@ pub(crate) mod dep_tracking {
         Edition,
         LinkerPluginLto,
         ResolveDocLinks,
+        RmetaStripSpans,
         SplitDebuginfo,
         SplitDwarfKind,
         StackProtector,
