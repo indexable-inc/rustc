@@ -655,11 +655,25 @@ pub enum RmetaStripSpans {
     None,
     /// Strip spans everywhere except in the parts of metadata that dependent
     /// crates compile into their own output: encoded MIR bodies (used for
-    /// cross-crate inlining, generic instantiation, and const evaluation) and
-    /// hygiene expansion data. What is given up: diagnostics reported in
-    /// dependent crates lose the ability to point into this crate's source for
-    /// item-level spans (e.g. "function defined here" notes fall back to
-    /// dummy spans). Debuginfo for inlined/generic code is unaffected.
+    /// cross-crate inlining, generic instantiation, and const evaluation),
+    /// hygiene expansion data, and the definition spans of items whose MIR is
+    /// exported (a dependent deriving debuginfo for an inlined function takes
+    /// its declaration file/line from the definition span; stripping it while
+    /// keeping body spans was verified to produce line rows bound to the
+    /// wrong file). What is given up: diagnostics reported in dependent
+    /// crates lose the ability to point into this crate's source for
+    /// item-level spans of items without exported MIR (e.g. "function defined
+    /// here" notes fall back to dummy spans).
+    ///
+    /// Stability boundary (measured, deliberate): because the preserved spans
+    /// are byte offsets and the referenced source files' length and line
+    /// tables must stay real for those spans to resolve correctly in
+    /// dependents, only edits that preserve byte positions (same-length
+    /// comment rewrites, same-length body edits) leave the metadata
+    /// byte-identical in this mode. Any length-changing edit, even a comment
+    /// appended at end of file, perturbs the source file record and thus the
+    /// metadata. Use `All` when byte-stability under general non-interface
+    /// edits is the goal.
     NonExported,
     /// Additionally strip spans inside encoded MIR bodies and hygiene
     /// expansion data, and replace expansion hashes with span-independent

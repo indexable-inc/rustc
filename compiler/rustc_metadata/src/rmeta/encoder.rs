@@ -89,6 +89,11 @@ pub(super) struct EncodeContext<'a, 'tcx> {
     // metadata stub. `None` when the flag is off or the root has not been
     // encoded yet.
     content_svh: Option<Svh>,
+    // In `RmetaStripSpans::NonExported` mode, the local defs whose MIR is
+    // exported (the `should_encode_mir` set); their item-level spans are
+    // preserved together with their body spans. Empty in other modes.
+    // Populated by `encode_def_ids`.
+    mir_exported_defs: LocalDefIdSet,
 }
 
 /// If the current crate is a proc-macro, returns early with `LazyArray::default()`.
@@ -475,6 +480,15 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let res = f(self);
         self.span_stripping_paused = old;
         res
+    }
+
+    /// Whether `def_id`'s item-level spans (`def_span`, `def_ident_span`)
+    /// must be preserved in `RmetaStripSpans::NonExported` mode because the
+    /// item's MIR is exported. See the comment at the use site in
+    /// `encode_def_ids`.
+    fn preserve_item_spans(&self, def_id: LocalDefId) -> bool {
+        self.strip_spans == RmetaStripSpans::NonExported
+            && self.mir_exported_defs.contains(&def_id)
     }
 
     fn emit_lazy_distance(&mut self, position: NonZero<usize>) {
@@ -1575,6 +1589,23 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         let tcx = self.tcx;
 
+        if self.strip_spans == RmetaStripSpans::NonExported {
+            // Compute the set of defs whose MIR will be exported (the same
+            // filter `encode_mir` uses), so their item-level spans can be
+            // preserved below.
+            let reachable_set = tcx.reachable_set(());
+            self.mir_exported_defs = tcx
+                .mir_keys(())
+                .iter()
+                .copied()
+                .filter(|&def_id| {
+                    let (encode_const, encode_opt) =
+                        should_encode_mir(tcx, reachable_set, def_id);
+                    encode_const || encode_opt
+                })
+                .collect();
+        }
+
         for local_id in tcx.iter_local_def_id() {
             let def_id = local_id.to_def_id();
             let def_kind = tcx.def_kind(local_id);
@@ -1598,9 +1629,25 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 record!(self.tables.default_fields[def_id] <- anon.def_id.to_def_id());
             }
 
+            // In `RmetaStripSpans::NonExported` mode, the definition spans of
+            // items whose MIR is exported must survive alongside the MIR body
+            // spans: a dependent crate that inlines such an item derives the
+            // function's debuginfo declaration file/line from its `def_span`,
+            // and binds the inlined instructions' line rows to that file. With
+            // the definition span stripped but body spans kept, the dependent
+            // would emit line rows carrying this crate's real line numbers
+            // bound to one of its own files, i.e. confidently wrong debuginfo
+            // (empirically verified via DWARF inspection).
+            let preserve_item_spans = self.preserve_item_spans(local_id);
             if should_encode_span(def_kind) {
                 let def_span = tcx.def_span(local_id);
-                record!(self.tables.def_span[def_id] <- def_span);
+                if preserve_item_spans {
+                    self.with_span_stripping_paused(
+                        |this| record!(this.tables.def_span[def_id] <- def_span),
+                    );
+                } else {
+                    record!(self.tables.def_span[def_id] <- def_span);
+                }
             }
             if should_encode_attrs(def_kind) {
                 self.encode_attrs(local_id);
@@ -1611,7 +1658,13 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             if should_encode_span(def_kind)
                 && let Some(ident_span) = tcx.def_ident_span(def_id)
             {
-                record!(self.tables.def_ident_span[def_id] <- ident_span);
+                if preserve_item_spans {
+                    self.with_span_stripping_paused(
+                        |this| record!(this.tables.def_ident_span[def_id] <- ident_span),
+                    );
+                } else {
+                    record!(self.tables.def_ident_span[def_id] <- ident_span);
+                }
             }
             if def_kind.has_codegen_attrs() {
                 record!(self.tables.codegen_fn_attrs[def_id] <- self.tcx.codegen_fn_attrs(def_id));
@@ -2779,6 +2832,7 @@ fn with_encode_metadata_header<R>(
         },
         span_stripping_paused: false,
         content_svh: None,
+        mir_exported_defs: LocalDefIdSet::default(),
     };
 
     // Encode the rustc version string in a predictable location.

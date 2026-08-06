@@ -126,6 +126,11 @@ fn main() {
         "signature change did NOT change the rmeta; interface changes must stay visible"
     );
 
+    // A trailing comment (nothing after it changes) must also be stable.
+    let trailing_edit = format!("{BASE}// trailing note\n");
+    let trailing = compile(&trailing_edit, STABILITY_FLAGS);
+    assert!(base == trailing, "trailing comment changed the rmeta despite stability flags");
+
     // `-Zrmeta-normalize-src-hash` alone must stabilize a length-and-line
     // preserving comment edit (the only churn there is the source file hash).
     let base_src_hash_only = compile(BASE, &["-Zrmeta-normalize-src-hash"]);
@@ -133,5 +138,27 @@ fn main() {
     assert!(
         base_src_hash_only == comment_2c,
         "length-preserving comment edit changed the rmeta despite -Zrmeta-normalize-src-hash"
+    );
+
+    // `-Zrmeta-strip-spans=non-exported` preserves exported-MIR spans and the
+    // source file shape data they resolve through, so its documented
+    // stability boundary is byte-position-preserving edits: the same-length
+    // comment rewrite and the same-length private body edit stay identical,
+    // while the length-changing comment edit legitimately differs.
+    const NON_EXPORTED_FLAGS: &[&str] =
+        &["-Zrmeta-content-svh", "-Zrmeta-strip-spans=non-exported", "-Zrmeta-normalize-src-hash"];
+    let ne_base = compile(BASE, NON_EXPORTED_FLAGS);
+    let ne_2c = compile(&comment_edit_same_len, NON_EXPORTED_FLAGS);
+    assert!(ne_base == ne_2c, "same-length comment edit changed the rmeta under non-exported");
+    let ne_priv = compile(&private_body_edit, NON_EXPORTED_FLAGS);
+    assert!(
+        ne_base == ne_priv,
+        "same-length private body edit changed the rmeta under non-exported"
+    );
+    let ne_comment = compile(&comment_edit, NON_EXPORTED_FLAGS);
+    assert!(
+        ne_base != ne_comment,
+        "length-changing comment edit did NOT change the rmeta under non-exported; \
+        preserved MIR spans should have shifted (documented stability boundary)"
     );
 }
