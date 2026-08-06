@@ -16,8 +16,9 @@ use rustc_session::config::{
     InstrumentCoverage, InstrumentMcount, InstrumentMcountOpts, InstrumentXRay, LinkSelfContained,
     LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig, Offload, Options,
     OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes, PatchableFunctionEntry,
-    Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion,
-    WasiExecModel, build_configuration, build_session_options, rustc_optgroups,
+    Polonius, ProcMacroExecutionStrategy, RmetaStripSpans, Strip, SwitchWithOptPath,
+    SymbolManglingVersion, WasiExecModel, build_configuration, build_session_options,
+    rustc_optgroups,
 };
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
@@ -877,6 +878,9 @@ fn test_unstable_options_tracking_hash() {
     tracked!(regparm, Some(3));
     tracked!(relax_elf_relocations, Some(true));
     tracked!(remap_cwd_prefix, Some(PathBuf::from("abc")));
+    tracked!(rmeta_content_svh, true);
+    tracked!(rmeta_normalize_src_hash, true);
+    tracked!(rmeta_strip_spans, RmetaStripSpans::All);
     tracked!(sanitizer, SanitizerSet::ADDRESS);
     tracked!(sanitizer_cfi_canonical_jump_tables, None);
     tracked!(sanitizer_cfi_generalize_pointers, Some(true));

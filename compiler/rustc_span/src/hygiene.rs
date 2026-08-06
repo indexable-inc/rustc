@@ -158,6 +158,20 @@ impl ExpnHash {
     fn new(stable_crate_id: StableCrateId, local_hash: Hash64) -> ExpnHash {
         ExpnHash(Fingerprint::new(stable_crate_id.0, local_hash))
     }
+
+    /// Builds an [ExpnHash] from its parts, bypassing the usual computation
+    /// over the expansion's [ExpnData].
+    ///
+    /// This is only meant for `-Zrmeta-strip-spans=all` metadata encoding,
+    /// which replaces the real expansion hashes (whose inputs include source
+    /// positions) with hashes derived from the crate-local expansion index, so
+    /// that the encoded metadata does not vary with source positions.
+    /// `local_hash` must be unique within the crate identified by
+    /// `stable_crate_id`, and must be non-zero for non-root expansions so the
+    /// result cannot be confused with the root [ExpnHash].
+    pub fn from_parts(stable_crate_id: StableCrateId, local_hash: Hash64) -> ExpnHash {
+        ExpnHash::new(stable_crate_id, local_hash)
+    }
 }
 
 /// A property of a macro expansion that determines how identifiers

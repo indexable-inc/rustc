@@ -887,6 +887,7 @@ mod desc {
         "one of supported split-debuginfo modes (`off`, `packed`, or `unpacked`)";
     pub(crate) const parse_split_dwarf_kind: &str =
         "one of supported split dwarf modes (`split` or `single`)";
+    pub(crate) const parse_rmeta_strip_spans: &str = "one of `none`, `non-exported` or `all`";
     pub(crate) const parse_link_self_contained: &str = "one of: `y`, `yes`, `on`, `n`, `no`, `off`, or a list of enabled (`+` prefix) and disabled (`-` prefix) \
         components: `crto`, `libc`, `unwind`, `linker`, `sanitizers`, `mingw`";
     pub(crate) const parse_linker_features: &str =
@@ -1997,6 +1998,14 @@ pub mod parse {
         true
     }
 
+    pub(crate) fn parse_rmeta_strip_spans(slot: &mut RmetaStripSpans, v: Option<&str>) -> bool {
+        match v.and_then(|s| RmetaStripSpans::from_str(s).ok()) {
+            Some(e) => *slot = e,
+            _ => return false,
+        }
+        true
+    }
+
     pub(crate) fn parse_stack_protector(slot: &mut StackProtector, v: Option<&str>) -> bool {
         match v.and_then(|s| StackProtector::from_str(s).ok()) {
             Some(ssp) => *slot = ssp,
@@ -2792,6 +2801,23 @@ written to standard error output)"),
         "do not skip rigid aliases in normalization for internal debugging"),
     retpoline: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: Retpoline },
         "enables retpoline-indirect-branches and retpoline-indirect-calls target features (default: no)"),
+    rmeta_content_svh: bool = (false, parse_bool, [TRACKED],
+        "derive the SVH stored in crate metadata from the encoded metadata bytes themselves \
+        instead of from the HIR, so that it is stable exactly when the rest of the metadata is; \
+        incompatible with incremental compilation (default: no)"),
+    rmeta_normalize_src_hash: bool = (false, parse_bool, [TRACKED],
+        "replace per-file source content hashes in crate metadata with zeroes, so that the \
+        metadata does not vary with source file contents that no encoded item depends on; \
+        dependent crates lose cross-crate diagnostic source snippets and debuginfo file \
+        checksums for this crate (default: no)"),
+    rmeta_strip_spans: RmetaStripSpans = (RmetaStripSpans::None, parse_rmeta_strip_spans, [TRACKED],
+        "replace spans with dummy spans when encoding crate metadata, so that the encoded bytes \
+        do not depend on source positions; degrades diagnostics and (with `all`) debuginfo \
+        reported in dependent crates against this crate
+
+        `none`: encode all spans faithfully (default)
+        `non-exported`: strip spans except in encoded MIR bodies and hygiene expansion data
+        `all`: strip every span, including exported MIR and hygiene expansion data"),
     retpoline_external_thunk: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: RetpolineExternalThunk },
         "enables retpoline-external-thunk, retpoline-indirect-branches and retpoline-indirect-calls \
         target features (default: no)"),

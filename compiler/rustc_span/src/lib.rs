@@ -1761,6 +1761,18 @@ impl Display for SourceFileHash {
 }
 
 impl SourceFileHash {
+    /// Returns a `SourceFileHash` of the given `kind` with an all-zero value.
+    ///
+    /// This is only meant for `-Zrmeta-normalize-src-hash`, which replaces
+    /// the per-file content hashes recorded in crate metadata so that they do
+    /// not vary with file contents. An all-zero value does not match the hash
+    /// of any actual source file (up to hash collisions), so consumers that
+    /// verify on-disk source against the recorded hash treat the source as
+    /// unavailable rather than silently using stale source.
+    pub fn zeroed(kind: SourceFileHashAlgorithm) -> SourceFileHash {
+        SourceFileHash { kind, value: [0; 32] }
+    }
+
     pub fn new_in_memory(kind: SourceFileHashAlgorithm, src: impl AsRef<[u8]>) -> SourceFileHash {
         let mut hash = SourceFileHash { kind, value: Default::default() };
         let len = hash.hash_len();
