@@ -16,6 +16,7 @@ use rustc_feature::Features;
 use rustc_hir::attrs::AttributeKind;
 use rustc_session::Session;
 use rustc_session::lint::builtin::UNNAMEABLE_TEST_ITEMS;
+use rustc_session::parse::{CollectedTest, CollectedTestType, TestShouldPanic};
 use rustc_span::hygiene::{AstPass, SyntaxContext, Transparency};
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
 use rustc_target::spec::PanicStrategy;
@@ -254,7 +255,50 @@ fn generate_test_harness(
         test_runner,
     };
 
-    TestHarnessGenerator { cx, tests: Vec::new() }.visit_crate(krate);
+    let mut generator = TestHarnessGenerator { cx, tests: Vec::new() };
+    generator.visit_crate(krate);
+
+    if sess.opts.unstable_opts.dump_test_names.enabled() {
+        record_collected_tests(sess, &generator.cx);
+    }
+}
+
+/// Reduce `psess.collected_tests` to exactly the tests the generated harness
+/// registers, in the order the harness registers them.
+///
+/// `rustc_builtin_macros::test` records an entry for every `#[test]`/`#[bench]`
+/// attribute it expands, which is a superset of what ends up in the harness: tests
+/// nested inside function bodies are expanded but are not nameable, so the harness
+/// drops them (and lints with `unnameable_test_items`). `cx.test_cases` is the
+/// authoritative set, so it decides membership and ordering here.
+fn record_collected_tests(sess: &Session, cx: &TestCtxt<'_>) {
+    // Same sort the harness applies in `mk_tests_slice`, which is also the order
+    // libtest reports tests in.
+    let mut tests = cx.test_cases.clone();
+    tests.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+
+    sess.psess.collected_tests.with_lock(|collected| {
+        let expanded = mem::take(collected);
+        for test in tests {
+            // A test whose metadata is missing was produced by `#[test_case]` rather
+            // than `#[test]`, so there is nothing to look up; report the name with
+            // libtest's defaults for the rest.
+            let desc = expanded.get(&test.name).cloned().unwrap_or_else(|| CollectedTest {
+                name: test.name,
+                is_bench: false,
+                ignore: false,
+                ignore_message: None,
+                should_panic: TestShouldPanic::No,
+                test_type: CollectedTestType::Unknown,
+                source_file: sym::empty,
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 0,
+            });
+            collected.insert(test.name, desc);
+        }
+    });
 }
 
 /// Creates a function item for use as the main function of a test build.

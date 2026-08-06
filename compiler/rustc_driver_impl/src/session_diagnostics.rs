@@ -113,3 +113,10 @@ pub(crate) struct IceExcludeCargoDefaults;
 pub(crate) struct UnstableFeatureUsage {
     pub error: Box<dyn Error>,
 }
+
+#[derive(Diagnostic)]
+#[diag("cannot write test names to `{$path}`: {$error}")]
+pub(crate) struct CantDumpTestNames<'a> {
+    pub path: &'a std::path::Path,
+    pub error: std::io::Error,
+}
