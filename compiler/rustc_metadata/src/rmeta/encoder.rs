@@ -197,16 +197,30 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
     }
 
     fn encode_span(&mut self, span: Span) {
-        // `-Zrmeta-strip-spans`: encode a dummy span instead of the real one,
-        // so that the encoded bytes do not depend on source positions. What
-        // this gives up: any consumer of this span in a dependent crate (e.g.
-        // a "function defined here" diagnostic note, or, in `all` mode,
-        // debuginfo line info for inlined MIR) sees `DUMMY_SP` instead of a
-        // location in this crate's source. Spans of source files that are
-        // never referenced are not encoded at all, which also keeps the
-        // source file table (and its per-file content hashes) from being
-        // encoded for stripped files.
-        let span = if self.should_strip_span() { DUMMY_SP } else { span };
+        // `-Zrmeta-strip-spans`: encode a dummy-location span instead of the
+        // real one, so that the encoded bytes do not depend on source
+        // positions. What this gives up: any consumer of this span in a
+        // dependent crate (e.g. a "function defined here" diagnostic note,
+        // or, in `all` mode, debuginfo line info for inlined MIR) sees a
+        // dummy location instead of a location in this crate's source. Spans
+        // of source files that are never referenced are not encoded at all,
+        // which also keeps the source file table (and its per-file content
+        // hashes) from being encoded for stripped files.
+        //
+        // Only the *location* half of the span is stripped; its
+        // `SyntaxContext` is preserved (encoded via the `SpanKind::Partial`
+        // form, exactly like a genuine dummy-location span with hygiene).
+        // The context is not a source position: identifier spans carry the
+        // identifier's hygiene mark there, and a dependent crate's resolver
+        // keys module bindings on (name, namespace, normalized context) when
+        // rebuilding an external module's graph, so two macro-generated
+        // same-name bindings that differ only by hygiene *must* decode with
+        // distinct contexts or the consumer ICEs on the collision ("an
+        // external binding was already defined"). Syntax contexts are
+        // allocated in expansion order, which depends only on the token
+        // stream, so preserving them keeps the metadata independent of
+        // source positions.
+        let span = if self.should_strip_span() { DUMMY_SP.with_ctxt(span.ctxt()) } else { span };
         match self.span_shorthands.entry(span) {
             Entry::Occupied(o) => {
                 // If an offset is smaller than the absolute position, we encode with the offset.
@@ -487,8 +501,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     /// item's MIR is exported. See the comment at the use site in
     /// `encode_def_ids`.
     fn preserve_item_spans(&self, def_id: LocalDefId) -> bool {
-        self.strip_spans == RmetaStripSpans::NonExported
-            && self.mir_exported_defs.contains(&def_id)
+        self.strip_spans == RmetaStripSpans::NonExported && self.mir_exported_defs.contains(&def_id)
     }
 
     fn emit_lazy_distance(&mut self, position: NonZero<usize>) {
@@ -1599,8 +1612,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 .iter()
                 .copied()
                 .filter(|&def_id| {
-                    let (encode_const, encode_opt) =
-                        should_encode_mir(tcx, reachable_set, def_id);
+                    let (encode_const, encode_opt) = should_encode_mir(tcx, reachable_set, def_id);
                     encode_const || encode_opt
                 })
                 .collect();
