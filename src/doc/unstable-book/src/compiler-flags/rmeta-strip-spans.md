@@ -2,11 +2,21 @@
 
 ---
 
-This flag replaces spans with dummy spans when encoding crate metadata, so
-that the encoded bytes do not depend on source positions. Spans in metadata
-are byte offsets into this crate's source files, so by default any edit that
-shifts source text (adding a comment, a blank line, editing a function body)
-changes the metadata of the crate even when its interface is unchanged.
+This flag replaces span locations with dummy locations when encoding crate
+metadata, so that the encoded bytes do not depend on source positions. Spans
+in metadata are byte offsets into this crate's source files, so by default any
+edit that shifts source text (adding a comment, a blank line, editing a
+function body) changes the metadata of the crate even when its interface is
+unchanged.
+
+Only the location half of each span is stripped. The syntax context (hygiene
+mark) a span carries is preserved in every mode: identifier spans carry the
+identifier's hygiene there, and dependent crates key module bindings on
+(name, namespace, normalized syntax context), so macro-generated same-name
+bindings that differ only by hygiene must keep distinct contexts for
+dependents to compile at all. Syntax contexts are allocated in expansion
+order, which depends only on the token stream, not on source positions, so
+preserving them does not reintroduce position-dependence.
 
 * `-Zrmeta-strip-spans=none` (default): encode all spans faithfully.
 * `-Zrmeta-strip-spans=non-exported`: strip spans except in the metadata that
